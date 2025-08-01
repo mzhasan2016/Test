@@ -1,0 +1,924 @@
+# End-to-End Feature Development Guide
+
+## Overview
+
+This guide provides a comprehensive step-by-step process for creating complete features in the EnergyExe application, covering both backend and frontend development with best practices.
+
+## Architecture Overview
+
+### Backend Stack
+- **Framework**: FastAPI with async/await
+- **Database**: PostgreSQL with SQLAlchemy 2.0 (async)
+- **Validation**: Pydantic v2 schemas
+- **Migration**: Alembic
+- **Authentication**: JWT tokens
+- **Architecture**: Layered (API → Service → Model → Database)
+
+### Frontend Stack
+- **Framework**: React 18 with TypeScript
+- **Routing**: TanStack Router (file-based)
+- **State Management**: TanStack Query
+- **Forms**: TanStack Form
+- **UI**: shadcn/ui components
+- **Build Tool**: Vite
+
+## Step-by-Step Feature Development
+
+Let's use **"Projects"** as an example feature to demonstrate the complete process.
+
+---
+
+## Phase 1: Backend Development
+
+### Step 1: Create Database Model
+
+**File**: `energyexe-core-backend/app/models/project.py`
+
+```python
+"""Project model."""
+
+from datetime import datetime
+from sqlalchemy import Boolean, DateTime, Integer, String, Text, ForeignKey
+from sqlalchemy.orm import Mapped, mapped_column, relationship
+
+from app.core.database import Base
+
+
+class Project(Base):
+    """Project model."""
+    
+    __tablename__ = "projects"
+    
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
+    name: Mapped[str] = mapped_column(String(255), nullable=False)
+    description: Mapped[str] = mapped_column(Text, nullable=True)
+    status: Mapped[str] = mapped_column(String(50), default="active", nullable=False)
+    budget: Mapped[float] = mapped_column(nullable=True)
+    start_date: Mapped[datetime] = mapped_column(DateTime, nullable=True)
+    end_date: Mapped[datetime] = mapped_column(DateTime, nullable=True)
+    
+    # Foreign Key
+    owner_id: Mapped[int] = mapped_column(Integer, ForeignKey("users.id"), nullable=False)
+    
+    # Relationships
+    owner: Mapped["User"] = relationship("User", back_populates="projects")
+    
+    # Audit fields
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False
+    )
+    
+    def __repr__(self) -> str:
+        """String representation of Project."""
+        return f"<Project(id={self.id}, name='{self.name}', status='{self.status}')>"
+```
+
+**Update**: `energyexe-core-backend/app/models/__init__.py`
+
+```python
+"""Database models package."""
+
+from .user import User
+from .project import Project
+
+__all__ = ["User", "Project"]
+```
+
+**Update**: `energyexe-core-backend/app/models/user.py` (add relationship)
+
+```python
+# Add to User model class
+projects: Mapped[List["Project"]] = relationship("Project", back_populates="owner")
+```
+
+### Step 2: Create Pydantic Schemas
+
+**File**: `energyexe-core-backend/app/schemas/project.py`
+
+```python
+"""Project schemas for request/response validation."""
+
+from datetime import datetime
+from typing import Optional
+from enum import Enum
+
+from pydantic import BaseModel, Field
+
+
+class ProjectStatus(str, Enum):
+    """Project status enumeration."""
+    ACTIVE = "active"
+    COMPLETED = "completed"
+    ON_HOLD = "on_hold"
+    CANCELLED = "cancelled"
+
+
+class ProjectBase(BaseModel):
+    """Base project schema."""
+    name: str = Field(..., min_length=1, max_length=255)
+    description: Optional[str] = Field(None, max_length=2000)
+    status: ProjectStatus = ProjectStatus.ACTIVE
+    budget: Optional[float] = Field(None, ge=0)
+    start_date: Optional[datetime] = None
+    end_date: Optional[datetime] = None
+    owner_id: int
+
+
+class ProjectCreate(ProjectBase):
+    """Schema for creating a project."""
+    pass
+
+
+class ProjectUpdate(BaseModel):
+    """Schema for updating a project."""
+    name: Optional[str] = Field(None, min_length=1, max_length=255)
+    description: Optional[str] = Field(None, max_length=2000)
+    status: Optional[ProjectStatus] = None
+    budget: Optional[float] = Field(None, ge=0)
+    start_date: Optional[datetime] = None
+    end_date: Optional[datetime] = None
+    owner_id: Optional[int] = None
+
+
+class ProjectResponse(ProjectBase):
+    """Schema for project response."""
+    id: int
+    is_active: bool
+    created_at: datetime
+    updated_at: datetime
+    
+    # Related data
+    owner: Optional[dict] = None  # Will be populated with user data
+    
+    class Config:
+        """Pydantic config."""
+        from_attributes = True
+
+
+class ProjectSearchParams(BaseModel):
+    """Schema for project search parameters."""
+    skip: int = Field(0, ge=0)
+    limit: int = Field(100, ge=1, le=1000)
+    search: Optional[str] = None
+    status: Optional[ProjectStatus] = None
+    owner_id: Optional[int] = None
+```
+
+**Update**: `energyexe-core-backend/app/schemas/__init__.py`
+
+```python
+"""Schemas package."""
+
+from .user import UserBase, UserCreate, UserUpdate, UserResponse
+from .project import ProjectBase, ProjectCreate, ProjectUpdate, ProjectResponse, ProjectSearchParams
+
+__all__ = [
+    "UserBase", "UserCreate", "UserUpdate", "UserResponse",
+    "ProjectBase", "ProjectCreate", "ProjectUpdate", "ProjectResponse", "ProjectSearchParams"
+]
+```
+
+### Step 3: Create Service Layer
+
+**File**: `energyexe-core-backend/app/services/project.py`
+
+```python
+"""Project service for business logic."""
+
+from typing import List, Optional
+
+import structlog
+from sqlalchemy import select, or_, and_
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import selectinload
+
+from app.core.exceptions import NotFoundException, ValidationException
+from app.models.project import Project
+from app.models.user import User
+from app.schemas.project import ProjectCreate, ProjectUpdate, ProjectSearchParams
+
+logger = structlog.get_logger()
+
+
+class ProjectService:
+    """Service for project-related operations."""
+    
+    def __init__(self, db: AsyncSession):
+        self.db = db
+    
+    async def get_by_id(self, project_id: int, include_owner: bool = True) -> Optional[Project]:
+        """Get project by ID."""
+        query = select(Project).where(Project.id == project_id)
+        
+        if include_owner:
+            query = query.options(selectinload(Project.owner))
+        
+        result = await self.db.execute(query)
+        return result.scalar_one_or_none()
+    
+    async def get_all(self, params: ProjectSearchParams) -> List[Project]:
+        """Get all projects with optional filtering."""
+        query = select(Project).options(selectinload(Project.owner))
+        
+        # Apply filters
+        filters = [Project.is_active == True]
+        
+        if params.search:
+            search_filter = or_(
+                Project.name.ilike(f"%{params.search}%"),
+                Project.description.ilike(f"%{params.search}%")
+            )
+            filters.append(search_filter)
+        
+        if params.status:
+            filters.append(Project.status == params.status)
+        
+        if params.owner_id:
+            filters.append(Project.owner_id == params.owner_id)
+        
+        query = query.where(and_(*filters))
+        query = query.offset(params.skip).limit(params.limit)
+        query = query.order_by(Project.created_at.desc())
+        
+        result = await self.db.execute(query)
+        return list(result.scalars().all())
+    
+    async def create(self, project_data: ProjectCreate) -> Project:
+        """Create a new project."""
+        # Validate owner exists
+        owner = await self.db.get(User, project_data.owner_id)
+        if not owner:
+            raise ValidationException("Owner user not found")
+        
+        # Validate dates
+        if (project_data.start_date and project_data.end_date and 
+            project_data.start_date > project_data.end_date):
+            raise ValidationException("Start date cannot be after end date")
+        
+        # Create project
+        project = Project(**project_data.model_dump())
+        
+        self.db.add(project)
+        await self.db.commit()
+        await self.db.refresh(project)
+        
+        logger.info("Project created", project_id=project.id, name=project.name)
+        return project
+    
+    async def update(self, project_id: int, project_data: ProjectUpdate) -> Project:
+        """Update an existing project."""
+        project = await self.get_by_id(project_id, include_owner=False)
+        if not project:
+            raise NotFoundException("Project not found")
+        
+        # Validate owner if being updated
+        if project_data.owner_id:
+            owner = await self.db.get(User, project_data.owner_id)
+            if not owner:
+                raise ValidationException("Owner user not found")
+        
+        # Update fields
+        update_data = project_data.model_dump(exclude_unset=True)
+        for field, value in update_data.items():
+            setattr(project, field, value)
+        
+        await self.db.commit()
+        await self.db.refresh(project)
+        
+        logger.info("Project updated", project_id=project.id)
+        return project
+    
+    async def delete(self, project_id: int) -> None:
+        """Soft delete a project."""
+        project = await self.get_by_id(project_id, include_owner=False)
+        if not project:
+            raise NotFoundException("Project not found")
+        
+        project.is_active = False
+        await self.db.commit()
+        
+        logger.info("Project deleted", project_id=project.id)
+    
+    async def get_by_owner(self, owner_id: int) -> List[Project]:
+        """Get all projects by owner."""
+        query = select(Project).where(
+            and_(Project.owner_id == owner_id, Project.is_active == True)
+        ).order_by(Project.created_at.desc())
+        
+        result = await self.db.execute(query)
+        return list(result.scalars().all())
+```
+
+**Update**: `energyexe-core-backend/app/services/__init__.py`
+
+```python
+"""Services package."""
+
+from .user import UserService
+from .project import ProjectService
+
+__all__ = ["UserService", "ProjectService"]
+```
+
+### Step 4: Create API Endpoints
+
+**File**: `energyexe-core-backend/app/api/v1/endpoints/projects.py`
+
+```python
+"""Project management endpoints."""
+
+from typing import List
+
+import structlog
+from fastapi import APIRouter, Depends, HTTPException, Query, status
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.core.deps import get_current_active_user, get_current_superuser, get_db
+from app.core.exceptions import NotFoundException, ValidationException
+from app.models.user import User
+from app.schemas.project import (
+    ProjectCreate, ProjectResponse, ProjectUpdate, ProjectSearchParams
+)
+from app.services.project import ProjectService
+
+logger = structlog.get_logger()
+
+router = APIRouter()
+
+
+@router.get("/", response_model=List[ProjectResponse])
+async def get_projects(
+    skip: int = Query(0, ge=0, description="Number of records to skip"),
+    limit: int = Query(100, ge=1, le=1000, description="Number of records to return"),
+    search: str = Query(None, description="Search term to filter projects"),
+    status: str = Query(None, description="Filter by project status"),
+    owner_id: int = Query(None, description="Filter by owner ID"),
+    current_user: User = Depends(get_current_active_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Get all projects."""
+    project_service = ProjectService(db)
+    
+    # Non-superusers can only see their own projects
+    if not current_user.is_superuser:
+        owner_id = current_user.id
+    
+    params = ProjectSearchParams(
+        skip=skip,
+        limit=limit,
+        search=search,
+        status=status,
+        owner_id=owner_id
+    )
+    
+    projects = await project_service.get_all(params)
+    return projects
+
+
+@router.get("/{project_id}", response_model=ProjectResponse)
+async def get_project_by_id(
+    project_id: int,
+    current_user: User = Depends(get_current_active_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Get project by ID."""
+    project_service = ProjectService(db)
+    project = await project_service.get_by_id(project_id)
+    
+    if not project:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Project not found")
+    
+    # Check ownership permissions
+    if not current_user.is_superuser and project.owner_id != current_user.id:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Not authorized to view this project")
+    
+    return project
+
+
+@router.post("/", response_model=ProjectResponse, status_code=status.HTTP_201_CREATED)
+async def create_project(
+    project_data: ProjectCreate,
+    current_user: User = Depends(get_current_active_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Create a new project."""
+    project_service = ProjectService(db)
+    
+    # Non-superusers can only create projects for themselves
+    if not current_user.is_superuser:
+        project_data.owner_id = current_user.id
+    
+    try:
+        project = await project_service.create(project_data)
+        logger.info("Project created via API", project_id=project.id, user_id=current_user.id)
+        return project
+    except ValidationException as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=e.message)
+
+
+@router.put("/{project_id}", response_model=ProjectResponse)
+async def update_project(
+    project_id: int,
+    project_data: ProjectUpdate,
+    current_user: User = Depends(get_current_active_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Update a project."""
+    project_service = ProjectService(db)
+    
+    # Check if project exists and user has permission
+    existing_project = await project_service.get_by_id(project_id, include_owner=False)
+    if not existing_project:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Project not found")
+    
+    if not current_user.is_superuser and existing_project.owner_id != current_user.id:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Not authorized to update this project")
+    
+    # Non-superusers cannot change ownership
+    if not current_user.is_superuser and project_data.owner_id:
+        project_data.owner_id = None
+    
+    try:
+        updated_project = await project_service.update(project_id, project_data)
+        logger.info("Project updated via API", project_id=project_id, user_id=current_user.id)
+        return updated_project
+    except (NotFoundException, ValidationException) as e:
+        status_code = status.HTTP_404_NOT_FOUND if isinstance(e, NotFoundException) else status.HTTP_400_BAD_REQUEST
+        raise HTTPException(status_code=status_code, detail=e.message)
+
+
+@router.delete("/{project_id}")
+async def delete_project(
+    project_id: int,
+    current_user: User = Depends(get_current_active_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Delete a project."""
+    project_service = ProjectService(db)
+    
+    # Check if project exists and user has permission
+    existing_project = await project_service.get_by_id(project_id, include_owner=False)
+    if not existing_project:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Project not found")
+    
+    if not current_user.is_superuser and existing_project.owner_id != current_user.id:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Not authorized to delete this project")
+    
+    try:
+        await project_service.delete(project_id)
+        logger.info("Project deleted via API", project_id=project_id, user_id=current_user.id)
+        return {"message": "Project deleted successfully"}
+    except NotFoundException as e:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=e.message)
+
+
+@router.get("/my/projects", response_model=List[ProjectResponse])
+async def get_my_projects(
+    current_user: User = Depends(get_current_active_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Get current user's projects."""
+    project_service = ProjectService(db)
+    projects = await project_service.get_by_owner(current_user.id)
+    return projects
+```
+
+### Step 5: Update API Router
+
+**File**: `energyexe-core-backend/app/api/v1/router.py`
+
+```python
+"""Main API router."""
+
+from fastapi import APIRouter
+
+from app.api.v1.endpoints import auth, users, projects
+
+api_router = APIRouter()
+
+# Include all endpoint routers
+api_router.include_router(auth.router, prefix="/auth", tags=["authentication"])
+api_router.include_router(users.router, prefix="/users", tags=["users"])
+api_router.include_router(projects.router, prefix="/projects", tags=["projects"])
+```
+
+### Step 6: Create Database Migration
+
+```bash
+cd energyexe-core-backend
+poetry run alembic revision --autogenerate -m "Add projects table"
+poetry run alembic upgrade head
+```
+
+Solution,
+
+
+Certainly! Here’s how you would convert the described FastAPI + SQLAlchemy + Pydantic “Projects” feature to an Express.js + TypeScript + Prisma stack, using a layered architecture(Model → Service → Controller → Route).This is a common and scalable pattern for Node.js backends.
+
+Below is a full breakdown, including file structure, Prisma schema, and code for each layer.
+
+---
+
+## 1. File Structure
+
+```
+src/
+  prisma/
+    schema.prisma
+  models/
+    project.model.ts
+  services/
+    project.service.ts
+  controllers/
+    project.controller.ts
+  routes/
+    project.route.ts
+  middlewares/
+    auth.middleware.ts
+  utils/
+    errors.ts
+  app.ts
+```
+
+---
+
+## 2. Prisma Model
+
+**File:** `src/prisma/schema.prisma`
+```prisma
+model User {
+  id        Int       @id @default(autoincrement())
+  email     String    @unique
+  // ...other fields...
+  projects  Project[]
+}
+
+model Project {
+  id          Int      @id @default(autoincrement())
+  name        String
+  description String?
+  status      String   @default("active")
+  budget      Float?
+  startDate   DateTime?
+  endDate     DateTime?
+  ownerId     Int
+  owner       User     @relation(fields: [ownerId], references: [id])
+  isActive    Boolean  @default(true)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+}
+```
+- Run `npx prisma migrate dev --name add_projects_table` after updating.
+
+---
+
+## 3. Model Layer (TypeScript Types)
+
+**File:** `src/models/project.model.ts`
+```ts
+export type ProjectStatus = "active" | "completed" | "on_hold" | "cancelled";
+
+export interface ProjectBase {
+  name: string;
+  description?: string;
+  status?: ProjectStatus;
+  budget?: number;
+  startDate?: Date;
+  endDate?: Date;
+  ownerId: number;
+}
+
+export interface ProjectCreate extends ProjectBase {}
+
+export interface ProjectUpdate {
+  name?: string;
+  description?: string;
+  status?: ProjectStatus;
+  budget?: number;
+  startDate?: Date;
+  endDate?: Date;
+  ownerId?: number;
+}
+
+export interface ProjectResponse extends ProjectBase {
+  id: number;
+  isActive: boolean;
+  createdAt: Date;
+  updatedAt: Date;
+  owner?: any; // You can type this more strictly if needed
+}
+
+export interface ProjectSearchParams {
+  skip?: number;
+  limit?: number;
+  search?: string;
+  status?: ProjectStatus;
+  ownerId?: number;
+}
+```
+
+---
+
+## 4. Service Layer
+
+**File:** `src/services/project.service.ts`
+```ts
+import { PrismaClient, Project } from "@prisma/client";
+import { ProjectCreate, ProjectUpdate, ProjectSearchParams } from "../models/project.model";
+import { NotFoundError, ValidationError } from "../utils/errors";
+
+const prisma = new PrismaClient();
+
+export class ProjectService {
+  async getById(projectId: number, includeOwner = true): Promise<Project | null> {
+    return prisma.project.findUnique({
+      where: { id: projectId },
+      include: includeOwner ? { owner: true } : undefined,
+    });
+  }
+
+  async getAll(params: ProjectSearchParams): Promise<Project[]> {
+    const { skip = 0, limit = 100, search, status, ownerId } = params;
+    return prisma.project.findMany({
+      where: {
+        isActive: true,
+        ...(search && {
+          OR: [
+            { name: { contains: search, mode: "insensitive" } },
+            { description: { contains: search, mode: "insensitive" } },
+          ],
+        }),
+        ...(status && { status }),
+        ...(ownerId && { ownerId }),
+      },
+      include: { owner: true },
+      skip,
+      take: limit,
+      orderBy: { createdAt: "desc" },
+    });
+  }
+
+  async create(data: ProjectCreate): Promise<Project> {
+    // Validate owner exists
+    const owner = await prisma.user.findUnique({ where: { id: data.ownerId } });
+    if (!owner) throw new ValidationError("Owner user not found");
+
+    if (data.startDate && data.endDate && data.startDate > data.endDate) {
+      throw new ValidationError("Start date cannot be after end date");
+    }
+
+    return prisma.project.create({ data });
+  }
+
+  async update(projectId: number, data: ProjectUpdate): Promise<Project> {
+    const project = await prisma.project.findUnique({ where: { id: projectId } });
+    if (!project) throw new NotFoundError("Project not found");
+
+    if (data.ownerId) {
+      const owner = await prisma.user.findUnique({ where: { id: data.ownerId } });
+      if (!owner) throw new ValidationError("Owner user not found");
+    }
+
+    return prisma.project.update({
+      where: { id: projectId },
+      data,
+    });
+  }
+
+  async delete(projectId: number): Promise<void> {
+    const project = await prisma.project.findUnique({ where: { id: projectId } });
+    if (!project) throw new NotFoundError("Project not found");
+
+    await prisma.project.update({
+      where: { id: projectId },
+      data: { isActive: false },
+    });
+  }
+
+  async getByOwner(ownerId: number): Promise<Project[]> {
+    return prisma.project.findMany({
+      where: { ownerId, isActive: true },
+      orderBy: { createdAt: "desc" },
+    });
+  }
+}
+```
+
+---
+
+## 5. Controller Layer
+
+**File:** `src/controllers/project.controller.ts`
+```ts
+import { Request, Response, NextFunction } from "express";
+import { ProjectService } from "../services/project.service";
+import { ProjectCreate, ProjectUpdate } from "../models/project.model";
+
+const projectService = new ProjectService();
+
+export class ProjectController {
+  static async getProjects(req: Request, res: Response, next: NextFunction) {
+    try {
+      const { skip, limit, search, status, ownerId } = req.query;
+      // @ts-ignore
+      const currentUser = req.user;
+      let owner = ownerId ? Number(ownerId) : undefined;
+      if (!currentUser.isSuperuser) owner = currentUser.id;
+
+      const projects = await projectService.getAll({
+        skip: Number(skip) || 0,
+        limit: Number(limit) || 100,
+        search: search as string,
+        status: status as any,
+        ownerId: owner,
+      });
+      res.json(projects);
+    } catch (err) {
+      next(err);
+    }
+  }
+
+  static async getProjectById(req: Request, res: Response, next: NextFunction) {
+    try {
+      const projectId = Number(req.params.projectId);
+      // @ts-ignore
+      const currentUser = req.user;
+      const project = await projectService.getById(projectId);
+
+      if (!project) return res.status(404).json({ message: "Project not found" });
+      if (!currentUser.isSuperuser && project.ownerId !== currentUser.id)
+        return res.status(403).json({ message: "Not authorized to view this project" });
+
+      res.json(project);
+    } catch (err) {
+      next(err);
+    }
+  }
+
+  static async createProject(req: Request, res: Response, next: NextFunction) {
+    try {
+      // @ts-ignore
+      const currentUser = req.user;
+      const data: ProjectCreate = req.body;
+      if (!currentUser.isSuperuser) data.ownerId = currentUser.id;
+
+      const project = await projectService.create(data);
+      res.status(201).json(project);
+    } catch (err) {
+      next(err);
+    }
+  }
+
+  static async updateProject(req: Request, res: Response, next: NextFunction) {
+    try {
+      const projectId = Number(req.params.projectId);
+      // @ts-ignore
+      const currentUser = req.user;
+      const data: ProjectUpdate = req.body;
+
+      const existing = await projectService.getById(projectId, false);
+      if (!existing) return res.status(404).json({ message: "Project not found" });
+      if (!currentUser.isSuperuser && existing.ownerId !== currentUser.id)
+        return res.status(403).json({ message: "Not authorized to update this project" });
+
+      if (!currentUser.isSuperuser && data.ownerId) data.ownerId = undefined;
+
+      const updated = await projectService.update(projectId, data);
+      res.json(updated);
+    } catch (err) {
+      next(err);
+    }
+  }
+
+  static async deleteProject(req: Request, res: Response, next: NextFunction) {
+    try {
+      const projectId = Number(req.params.projectId);
+      // @ts-ignore
+      const currentUser = req.user;
+
+      const existing = await projectService.getById(projectId, false);
+      if (!existing) return res.status(404).json({ message: "Project not found" });
+      if (!currentUser.isSuperuser && existing.ownerId !== currentUser.id)
+        return res.status(403).json({ message: "Not authorized to delete this project" });
+
+      await projectService.delete(projectId);
+      res.json({ message: "Project deleted successfully" });
+    } catch (err) {
+      next(err);
+    }
+  }
+
+  static async getMyProjects(req: Request, res: Response, next: NextFunction) {
+    try {
+      // @ts-ignore
+      const currentUser = req.user;
+      const projects = await projectService.getByOwner(currentUser.id);
+      res.json(projects);
+    } catch (err) {
+      next(err);
+    }
+  }
+}
+```
+
+---
+
+## 6. Route Layer
+
+**File:** `src/routes/project.route.ts`
+```ts
+import { Router } from "express";
+import { ProjectController } from "../controllers/project.controller";
+import { authMiddleware } from "../middlewares/auth.middleware";
+
+const router = Router();
+
+router.get("/", authMiddleware, ProjectController.getProjects);
+router.get("/my/projects", authMiddleware, ProjectController.getMyProjects);
+router.get("/:projectId", authMiddleware, ProjectController.getProjectById);
+router.post("/", authMiddleware, ProjectController.createProject);
+router.put("/:projectId", authMiddleware, ProjectController.updateProject);
+router.delete("/:projectId", authMiddleware, ProjectController.deleteProject);
+
+export default router;
+```
+
+---
+
+## 7. Auth Middleware (Stub Example)
+
+**File:** `src/middlewares/auth.middleware.ts`
+```ts
+import { Request, Response, NextFunction } from "express";
+
+// This is a stub. Replace with your real JWT logic.
+export function authMiddleware(req: Request, res: Response, next: NextFunction) {
+  // Example: attach a fake user for demonstration
+  req.user = { id: 1, isSuperuser: true }; // Replace with real user extraction
+  next();
+}
+```
+
+---
+
+## 8. Error Utilities
+
+**File:** `src/utils/errors.ts`
+```ts
+export class NotFoundError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "NotFoundError";
+  }
+}
+
+export class ValidationError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "ValidationError";
+  }
+}
+```
+
+---
+
+## 9. App Entry
+
+**File:** `src/app.ts`
+```ts
+import express from "express";
+import projectRoutes from "./routes/project.route";
+
+const app = express();
+app.use(express.json());
+
+app.use("/api/projects", projectRoutes);
+
+// ...other routes...
+
+// Error handler
+app.use((err, req, res, next) => {
+  if (err.name === "ValidationError") return res.status(400).json({ message: err.message });
+  if (err.name === "NotFoundError") return res.status(404).json({ message: err.message });
+  return res.status(500).json({ message: "Internal server error" });
+});
+
+app.listen(3000, () => {
+  console.log("Server running on http://localhost:3000");
+});
+```
+
+---
+
+## 10. Migration
+
+- Run `npx prisma migrate dev --name add_projects_table` to create the table.
+
+---
+
+**This structure gives you a clean, maintainable, and scalable Express + TypeScript backend with Prisma, closely mirroring the FastAPI layered approach.**  
+You can now add validation, authentication, and more features as needed.
+
+Let me know if you want the code for any specific file, or help with the frontend!
