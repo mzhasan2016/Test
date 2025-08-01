@@ -1,4 +1,4 @@
-import { createFileRoute, redirect, useNavigate } from '@tanstack/react-router'
+import { createFileRoute, redirect, useNavigate, Link } from '@tanstack/react-router'
 import { useForm } from '@tanstack/react-form'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
@@ -115,6 +115,15 @@ function LoginPage() {
               {loginMutation.isPending ? 'Signing in...' : 'Sign in'}
             </Button>
           </form>
+
+          <div className="mt-4 text-center">
+            <p className="text-sm text-muted-foreground">
+              Don't have an account?{' '}
+              <Link to="/register" className="text-primary hover:underline">
+                Create one here
+              </Link>
+            </p>
+          </div>
         </CardContent>
       </Card>
     </div>
